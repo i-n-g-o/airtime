@@ -378,6 +378,231 @@ class ApiController extends Zend_Controller_Action
         }
     }
 
+    public function playerDayScheduleAction()
+    {
+        $this->view->layout()->disableLayout();
+        $this->_helper->viewRenderer->setNoRender(true);
+
+        header("Content-Type: application/json");
+
+        // timezones
+        $utcTimeZone = new DateTimeZone('UTC');
+        $stationTimezone = new DateTimeZone(Application_Model_Preference::GetDefaultTimezone());
+
+        $t1 = new DateTime("@".time(), $utcTimeZone);
+        $t1->setTime(0,0,0);
+
+        $t2 = new DateTime("@".time(), $utcTimeZone);
+        $t2->setTime(0,0,0);
+        $t2->add(DateInterval::createFromDateString('1 day'));
+
+
+
+
+        // 1. get all shows of the day
+
+        /*
+        start_timestamp	"2023-11-23 01:00:00"
+        end_timestamp	"2023-11-23 05:00:00"
+        name	"FRF Musikmix"
+        id	12
+        instance_id	6185
+        record	0
+        url	""
+        starts	"2023-11-23 01:00:00"
+        ends	"2023-11-23 05:00:00"
+        */
+
+        $utcTimeStart = $t1->format("Y-m-d H:i:s");
+
+        $end = Application_Common_DateHelper::getTodayStationEndDateTime();
+        $end->setTimezone(new DateTimeZone("UTC"));
+        $utcTimeEnd = $end->format("Y-m-d H:i:s");
+
+        // $day_shows = Application_Model_Schedule::GetPlayOrderRange();
+        $day_shows = Application_Model_Show::getNextShows($utcTimeStart, "ALL", $utcTimeEnd);
+
+        // XSS exploit prevention
+        foreach ($day_shows as &$next) {
+            $next["name"] = htmlspecialchars($next["name"]);
+        }
+
+
+        // 2. get day schedule (files)
+
+        /*
+        {
+        "media": {
+            "2023-11-23-09-00-00": {
+                "id": 182,
+                "type": "file",
+                "row_id": 1050,
+                "uri": "\/home\/frf-admin\/AutoDJ-test\/02_Uptownship.mp3",
+                "fade_in": 500,
+                "fade_out": 500,
+                "cue_in": 0.499,
+                "cue_out": 144.742,
+                "start": "2023-11-23-09-00-00",
+                "end": "2023-11-23-09-02-24",
+                "show_name": "Untitled Show",
+                "replay_gain": -1.61,
+                "independent_event": false
+            },
+            ...
+        }
+        */
+
+        $scheduled_items = Application_Model_Schedule::GetScheduleDetailItems($t1, $t2, array(), array());
+        // convert start/end to DateTime
+        foreach ($scheduled_items as &$item)
+        {
+            $item["sched_starts"] = DateTime::createFromFormat("Y-m-d H:i:s", explode(".", $item["sched_starts"])[0], $utcTimeZone);
+            $item["sched_ends"] = DateTime::createFromFormat("Y-m-d H:i:s", explode(".", $item["sched_ends"])[0], $utcTimeZone);
+        }
+
+        // $schedule_data = Application_Model_Schedule::getSchedule($t1->format("Y-m-d-H-i-s"), $t2->format("Y-m-d-H-i-s"));
+
+        // convert start/end to DateTime
+        // foreach ($schedule_data["media"] as &$item)
+        // {
+        //     // TODO: parse dates once!
+        //     $item["start"] = DateTime::createFromFormat("Y-m-d-H-i-s", $item["start"], $utcTimeZone);
+        //     $item["end"] = DateTime::createFromFormat("Y-m-d-H-i-s", $item["end"], $utcTimeZone);
+        // }
+
+
+        // Convert from UTC to station time for Web Browser.
+        // foreach ($schedule_data["media"] as &$item)
+        // {
+        //     // 2023-11-23-09-00-00
+        //     $t = explode("-", $item["start"]);
+        //     $item["starts"] = $t[0]."-".$t[1]."-".$t[2]." ".$t[3].":".$t[4].":".$t[5];
+
+        //     $t = explode("-", $item["end"]);
+        //     $item["ends"] = $t[0]."-".$t[1]."-".$t[2]." ".$t[3].":".$t[4].":".$t[5];
+        // }
+        // Application_Common_DateHelper::convertTimestamps($schedule_data["media"], array("starts", "ends"), "station");
+        
+
+
+
+        // 3. get autodj playlist data
+
+        $fn = "/var/log/airtime/ext/autodj_playlist.log";
+
+        $lines = array();
+        $autodj_entries = array();
+
+        if (file_exists($fn))
+        {
+            $txt_file = file_get_contents($fn);
+            $lines = explode("\n", $txt_file);
+        }
+
+        // iterate lines backwards
+        // break loop for wrong day
+        $index = count($lines);
+        while($index) {
+            $value = $lines[--$index];
+
+            $e = explode("\t", $value);
+            $f = $e;
+            array_shift($f); // *
+            array_shift($f); // start datetime
+            array_shift($f); // end datetime
+
+            // log-file line format:
+            //      start               end                 title   artist  path
+            // *	YYYY-MM-DD HH:mm:ss	YYYY-MM-DD HH:mm:ss	title	artist	path
+            if (count($e) > 3 &&
+                count($f) > 1 &&
+                strpos(strtolower($f[0]), 'jingle') !== 0)
+            {
+                // compare end to start of day
+                $end = DateTime::createFromFormat("Y-m-d H:i:s", $e[2], $stationTimezone);
+                if ($end < $t1) {
+                    break;
+                }
+
+                // insert at beginning of array
+                array_unshift($autodj_entries , array(
+                    "start" => DateTime::createFromFormat("Y-m-d H:i:s", $e[1], $stationTimezone), // start time
+                    "end" => $end, // end time
+                    "title" => $f[0],
+                    "artist" => $f[1]
+                ));
+            }
+        }
+
+
+        // add schedule-data to show-data
+
+
+        foreach ($day_shows as &$show)
+        {
+            $show_start_date = DateTime::createFromFormat("Y-m-d H:i:s", $show["starts"], $utcTimeZone);
+            $show_end_date = DateTime::createFromFormat("Y-m-d H:i:s", $show["ends"], $utcTimeZone);
+            $show["media"] = array();
+
+            // schedule data in UTC
+            foreach ($scheduled_items as &$item)
+            {
+                if ($item["sched_starts"] >= $show_start_date &&
+                    $item["sched_starts"] < $show_end_date)
+                {
+                    $item["sched_starts"]->setTimezone($stationTimezone);
+                    $item["sched_ends"]->setTimezone($stationTimezone);
+
+                    if (isset($item["file_track_title"]) &&
+                        isset($item["file_artist_name"]))
+                    {
+                        // append to array
+                        $show["media"][] = array(
+                            "start" => $item["sched_starts"]->format("H:i:s"),
+                            "end" => $item["sched_ends"]->format("H:i:s"),
+                            "title" => $item["file_track_title"],
+                            "artist" => $item["file_artist_name"]
+                        );                        
+                    }
+                }
+            }
+
+            $is_autodj = false;
+
+            // autodj times in local-time
+            foreach ($autodj_entries as &$item)
+            {
+                $item["start"]->setTimezone($utcTimeZone);
+
+                if ($item["end"] >= $show_start_date &&
+                    $item["end"] < $show_end_date)
+                {
+                    $is_autodj = true;
+                    
+                    $item["start"]->setTimezone($stationTimezone);
+                    $item["end"]->setTimezone($stationTimezone);
+                    
+                    $show["media"][] = array(
+                        "start" => $item["start"]->format("H:i:s"),
+                        "end" => $item["end"]->format("H:i:s"),
+                        "title" => $item["title"],
+                        "artist" => $item["artist"]
+                    );
+                }
+            }
+
+            $show["autodj"] = $is_autodj;
+        }
+
+        Application_Common_DateHelper::convertTimestamps($day_shows, array("starts", "ends", "start_timestamp", "end_timestamp"), "station");
+
+        // find Musikmix or gaps?
+        // populate musikmix with data from autodj playlist log
+
+        $data = $day_shows;
+
+        echo json_encode($data, JSON_FORCE_OBJECT);
+    }
     public function scheduleAction()
     {
         $this->view->layout()->disableLayout();
